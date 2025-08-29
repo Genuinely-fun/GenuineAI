@@ -1,0 +1,232 @@
+data = read.csv('reviews.csv')
+      
+
+# install.packages(c("dplyr", "stringr", "textclean", "tidytext", "textstem"))
+
+##   1. Data Collection: Obtain and preprocess Google location reviews. ##
+
+####################### STEP 1 ################################
+
+# Dataset structure
+
+# Remove duplicates
+
+# Handle missing values (drop or impute depending on field)
+
+# Standardize text encoding (UTF-8)
+
+library(dplyr)
+
+data_clean <- data %>%
+  distinct() %>%                                # remove full duplicates
+  filter(!is.na(text) & text != "") %>%         # remove empty reviews
+  mutate(across(c(business_name, author_name, rating_category), 
+                ~ trimws(.)))                   # strip extra spaces
+
+####################### STEP 2 ################################
+# Text cleaning
+
+# Lowercase
+
+# Remove punctuation, numbers, control characters
+
+# Expand contractions
+
+# Remove stopwords
+
+# (Optionally) Lemmatize or stem
+
+library(stringr)
+library(textclean)
+library(tidytext)
+library(textstem)
+
+# Base text cleaning
+data_clean <- data_clean %>%
+  mutate(
+    text_clean = text %>%
+      str_to_lower() %>%                       # lowercase
+      replace_contraction() %>%                # don't -> do not
+      replace_number(remove = TRUE) %>%        # drop numbers
+      str_replace_all("[[:punct:]]", " ") %>%  # remove punctuation
+      str_replace_all("[[:cntrl:]]", " ") %>%
+      str_squish()
+  )
+
+# Tokenization & stopword removal
+data_tokens <- data_clean %>%
+  unnest_tokens(word, text_clean) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(str_detect(word, "[a-z]"))   # keep alphabetic only
+
+# Optional: lemmatize words
+data_tokens <- data_tokens %>%
+  mutate(word = lemmatize_words(word))
+
+####################### STEP 3 ################################
+
+# Feature engineering (for ML downstream)
+
+# Since your policies include “ads / irrelevant / rant detection”, you should also create flags from text:
+
+data_clean <- data_clean %>%
+  mutate(
+    has_url   = str_detect(text, "http[s]?://|www\\."),
+    has_email = str_detect(text, "[[:alnum:]._%+-]+@[[:alnum:].-]+"),
+    has_phone = str_detect(text, "\\d{3,}[-.\\s]?\\d*"),  # rough pattern
+    text_len  = str_count(text, "\\w+"),                  # word count
+    has_profanity = str_detect(text, "(damn|shit|fuck)")   # extend lexicon
+  )
+
+
+####################### STEP 4 ################################
+
+# Handling the photo column
+
+# You can flag whether a review has an attached photo (evidence of visit):
+
+data_clean <- data_clean %>%
+  mutate(has_photo = !is.na(photo) & photo != "")
+
+
+####################### STEP 5 ################################
+
+# Save cleaned dataset
+
+write.csv(data_clean, "reviews_clean.csv", row.names = FALSE)
+data_clean <- readRDS("reviews_clean.rds")
+save(data_clean, file = "reviews_clean.RData")
+load("reviews_clean.RData")
+
+## 3. Feature Engineering: Extract both textual and non-textual features. ##
+
+####################### STEP 1 ################################
+
+# install.packages(c("tidyverse", "textdata", "text2vec"))
+
+# Install/load required packages
+#install.packages("syuzhet")
+library(tidyverse)
+library(tidytext)
+library(syuzhet)
+
+reviews <- data_clean$text_clean
+data_clean$review_id <- 1:nrow(data_clean)
+
+### --- Feature Engineering ---
+
+# 1. Metadata features
+data_clean <- data_clean %>%
+  mutate(
+    char_count = nchar(text_clean),
+    word_count = str_count(text_clean, "\\S+")
+  )
+
+# 2. Sentiment score (syuzhet, afinn, bing all available)
+data_clean$sentiment <- get_sentiment(data_clean$text_clean, method = "bing")
+
+# 3. TF-IDF features
+tokens <- data_clean %>%
+  unnest_tokens(word, text_clean) %>%
+  anti_join(stop_words, by = "word")
+
+tfidf <- tokens %>%
+  count(review_id, word) %>%
+  bind_tf_idf(word, review_id, n)
+
+# Example: keep top TF-IDF words per review
+top_tfidf <- tfidf %>%
+  group_by(review_id) %>%
+  slice_max(tf_idf, n = 5) %>%
+  ungroup()
+
+# Now you have:
+# - data_clean = structured metadata + sentiment
+# - top_tfidf = top words that define each review
+
+####################### STEP 2
+################################
+
+#Right now you have:
+  
+#  data_clean → metadata + sentiment features
+
+# tfidf → text features
+
+# ✅ You’ll want to merge them together so each review becomes a row with both metadata and text-based features.
+# In R you typically use a Document-Term Matrix (DTM) or TF-IDF matrix plus the metadata columns.
+# Make a wide TF-IDF matrix
+library(tidyr)
+
+tfidf_wide <- tfidf %>%
+  select(review_id, word, tf_idf) %>%
+  pivot_wider(names_from = word, values_from = tf_idf, values_fill = 0)
+
+# Combine with metadata (join on review_id)
+final_data <- data_clean %>%
+  left_join(tfidf_wide, by = "review_id")
+
+
+
+## 4. Modeling: Build and train ML/NLP models. ##
+
+####################### STEP 1 ################################
+
+# install.packages(c("caret", "randomForest"))
+
+library(dplyr)
+#library(caret)
+library(randomForest)
+
+# Ensure target is a factor
+#final_data$policy_violation <- as.factor(final_data$policy_violation)
+
+colSums(is.na(final_data))
+
+# Select feature columns and replace NAs with 0
+features <- final_data %>%
+  select(-review_id, -text_clean, -policy_violation) %>%
+  mutate_all(~replace(., is.na(.), 0))
+
+# Target column
+target <- final_data$policy_violation
+
+
+set.seed(123)
+
+# Example: 20% violations, 80% valid
+final_data$policy_violation <- sample(c(0,1), size = nrow(final_data), replace = TRUE, prob = c(0.8,0.2))
+
+table(final_data$policy_violation)
+
+
+
+library(caret)
+set.seed(123)
+trainIndex <- createDataPartition(target, p = 0.8, list = FALSE)
+
+train_data <- features[trainIndex, ]
+train_target <- target[trainIndex]
+
+test_data <- features[-trainIndex, ]
+test_target <- target[-trainIndex]
+
+
+library(randomForest)
+set.seed(123)
+
+rf_model <- randomForest(
+  x = train_data,
+  y = as.factor(train_target),
+  ntree = 200,
+  importance = TRUE
+)
+
+print(rf_model)
+
+predictions <- predict(rf_model, newdata = test_data)
+conf_matrix <- confusionMatrix(predictions, as.factor(test_target))
+print(conf_matrix)
+
+# Feature importance
+varImpPlot(rf_model)
