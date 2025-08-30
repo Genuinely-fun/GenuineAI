@@ -1,9 +1,11 @@
 data = read.csv('reviews.csv')
-      
+
 
 # install.packages(c("dplyr", "stringr", "textclean", "tidytext", "textstem"))
 
-##   1. Data Collection: Obtain and preprocess Google location reviews. ##
+########################
+# 1. DATA CLEANING
+########################
 
 ####################### STEP 1 ################################
 
@@ -98,22 +100,20 @@ data_clean <- readRDS("reviews_clean.rds")
 save(data_clean, file = "reviews_clean.RData")
 load("reviews_clean.RData")
 
-## 3. Feature Engineering: Extract both textual and non-textual features. ##
 
-####################### STEP 1 ################################
 
-# install.packages(c("tidyverse", "textdata", "text2vec"))
+########################
+# 2. FEATURE ENGINEERING
+########################
 
-# Install/load required packages
-#install.packages("syuzhet")
+# Required packages
 library(tidyverse)
 library(tidytext)
 library(syuzhet)
+library(tidyr)
 
-reviews <- data_clean$text_clean
+# Add review_id
 data_clean$review_id <- 1:nrow(data_clean)
-
-### --- Feature Engineering ---
 
 # 1. Metadata features
 data_clean <- data_clean %>%
@@ -122,7 +122,7 @@ data_clean <- data_clean %>%
     word_count = str_count(text_clean, "\\S+")
   )
 
-# 2. Sentiment score (syuzhet, afinn, bing all available)
+# 2. Sentiment score (Bing method)
 data_clean$sentiment <- get_sentiment(data_clean$text_clean, method = "bing")
 
 # 3. TF-IDF features
@@ -134,74 +134,47 @@ tfidf <- tokens %>%
   count(review_id, word) %>%
   bind_tf_idf(word, review_id, n)
 
-# Example: keep top TF-IDF words per review
-top_tfidf <- tfidf %>%
-  group_by(review_id) %>%
-  slice_max(tf_idf, n = 5) %>%
-  ungroup()
-
-# Now you have:
-# - data_clean = structured metadata + sentiment
-# - top_tfidf = top words that define each review
-
-####################### STEP 2
-################################
-
-#Right now you have:
-  
-#  data_clean → metadata + sentiment features
-
-# tfidf → text features
-
-# ✅ You’ll want to merge them together so each review becomes a row with both metadata and text-based features.
-# In R you typically use a Document-Term Matrix (DTM) or TF-IDF matrix plus the metadata columns.
-# Make a wide TF-IDF matrix
-library(tidyr)
-
+# Wide TF-IDF matrix
 tfidf_wide <- tfidf %>%
   select(review_id, word, tf_idf) %>%
   pivot_wider(names_from = word, values_from = tf_idf, values_fill = 0)
 
-# Combine with metadata (join on review_id)
+# Combine with metadata
 final_data <- data_clean %>%
   left_join(tfidf_wide, by = "review_id")
 
 
 
-## 4. Modeling: Build and train ML/NLP models. ##
+##################
+# 3. MODELING
+##################
 
-####################### STEP 1 ################################
-
-# install.packages(c("caret", "randomForest"))
-
-library(dplyr)
-#library(caret)
+library(caret)
 library(randomForest)
 
-# Ensure target is a factor
-#final_data$policy_violation <- as.factor(final_data$policy_violation)
+# Ensure target column exists — create synthetic labels if missing
+# (remove this part if you already have true labels!)
+if (!"policy_violation" %in% colnames(final_data)) {
+  set.seed(123)
+  final_data$policy_violation <- sample(
+    c(0,1),
+    size = nrow(final_data),
+    replace = TRUE,
+    prob = c(0.8, 0.2)
+  )
+}
 
-colSums(is.na(final_data))
+# Convert to factor
+final_data$policy_violation <- as.factor(final_data$policy_violation)
 
-# Select feature columns and replace NAs with 0
+# Handle NAs
 features <- final_data %>%
   select(-review_id, -text_clean, -policy_violation) %>%
   mutate_all(~replace(., is.na(.), 0))
 
-# Target column
 target <- final_data$policy_violation
 
-
-set.seed(123)
-
-# Example: 20% violations, 80% valid
-final_data$policy_violation <- sample(c(0,1), size = nrow(final_data), replace = TRUE, prob = c(0.8,0.2))
-
-table(final_data$policy_violation)
-
-
-
-library(caret)
+# Train-test split
 set.seed(123)
 trainIndex <- createDataPartition(target, p = 0.8, list = FALSE)
 
@@ -211,10 +184,8 @@ train_target <- target[trainIndex]
 test_data <- features[-trainIndex, ]
 test_target <- target[-trainIndex]
 
-
-library(randomForest)
+# Train Random Forest
 set.seed(123)
-
 rf_model <- randomForest(
   x = train_data,
   y = as.factor(train_target),
@@ -224,9 +195,31 @@ rf_model <- randomForest(
 
 print(rf_model)
 
+# Evaluate
 predictions <- predict(rf_model, newdata = test_data)
+
 conf_matrix <- confusionMatrix(predictions, as.factor(test_target))
 print(conf_matrix)
 
-# Feature importance
+# Feature importance plot
 varImpPlot(rf_model)
+
+
+library(randomForest)
+library(caret)
+
+# Train with class weights (heavier penalty on minority class "1")
+rf_model_weighted <- randomForest(
+  x = train_data,
+  y = as.factor(train_target),
+  ntree = 200,
+  importance = TRUE,
+  classwt = c("0" = 1, "1" = 5)  # Adjust weights (tune 5 higher/lower)
+)
+
+# Predict
+predictions_weighted <- predict(rf_model_weighted, newdata = test_data)
+
+# Evaluate
+conf_matrix_weighted <- confusionMatrix(predictions_weighted, as.factor(test_target))
+print(conf_matrix_weighted)
